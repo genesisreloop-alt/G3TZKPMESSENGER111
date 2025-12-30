@@ -1,0 +1,64 @@
+modules = ["web", "bash", "nodejs-22"]
+[agent]
+expertMode = true
+
+[nix]
+channel = "stable-25_05"
+packages = ["circom", "imagemagick"]
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Frontend"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "RelayServer"
+
+[[workflows.workflow]]
+name = "Frontend"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd \"G3TZKP-MESSENGER-BETA-main/G3TZKP-MESSENGER-BETA-main/G3ZKPBETAFINAL-main/g3tzkp-messenger UI\" && npm install --legacy-peer-deps 2>/dev/null; npm run dev"
+waitForPort = 5000
+
+[[workflows.workflow]]
+name = "RelayServer"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd \"G3TZKP-MESSENGER-BETA-main/G3TZKP-MESSENGER-BETA-main/G3ZKPBETAFINAL-main/g3tzkp-messenger UI/server\" && node relay-server.js"
+waitForPort = 3001
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[ports]]
+localPort = 3001
+externalPort = 3001
+
+[[ports]]
+localPort = 4001
+externalPort = 3000
+
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[deployment]
+deploymentTarget = "autoscale"
+run = ["npm", "run", "preview", "--", "--port", "5000", "--host", "0.0.0.0"]
+build = ["npm", "run", "build"]

@@ -1,0 +1,288 @@
+name: ZKP Circuits Production Build & Test
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'zkp-circuits/**'
+      - 'Packages/zkp/**'
+      - '.github/workflows/zkp-circuits.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'zkp-circuits/**'
+      - 'Packages/zkp/**'
+  workflow_dispatch:
+
+jobs:
+  compile-circuits:
+    name: Compile Production Circuits
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install global dependencies
+        run: |
+          npm install -g npm@latest
+
+      - name: Install zkp-circuits dependencies
+        run: |
+          cd zkp-circuits
+          npm install
+
+      - name: Verify Powers of Tau file
+        run: |
+          cd zkp-circuits
+          if [ ! -f pot12_final.ptau ]; then
+            echo "ERROR: Powers of Tau file not found"
+            exit 1
+          fi
+          echo "Powers of Tau file found: $(ls -lh pot12_final.ptau | awk '{print $5}')"
+
+      - name: Compile production circuits
+        run: |
+          cd zkp-circuits
+          bash compile-production.sh
+
+      - name: Verify compilation output
+        run: |
+          cd zkp-circuits/build
+          echo "=== Build Artifacts ==="
+          ls -lh | grep -E '\.(wasm|zkey|json)$'
+          
+          echo ""
+          echo "=== Verification Keys ==="
+          find . -name "*_verification_key.json" -exec echo "✓ {}" \;
+          
+          echo ""
+          echo "=== Circuit Registry ==="
+          if [ -f circuit_registry.json ]; then
+            cat circuit_registry.json | jq '.circuits | length'
+            echo "circuits found"
+          else
+            echo "ERROR: circuit_registry.json not found"
+            exit 1
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: zkp-build-artifacts
+          path: zkp-circuits/build/
+          retention-days: 30
+
+  test-circuits:
+    name: Test Production Circuits
+    runs-on: ubuntu-latest
+    needs: compile-circuits
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install zkp-circuits dependencies
+        run: |
+          cd zkp-circuits
+          npm install
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: zkp-build-artifacts
+          path: zkp-circuits/build/
+
+      - name: Run circuit tests
+        run: |
+          cd zkp-circuits
+          npm run test:circuits
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: zkp-test-results
+          path: zkp-circuits/test-results/
+          retention-days: 30
+
+  verify-integration:
+    name: Verify ZKP Engine Integration
+    runs-on: ubuntu-latest
+    needs: test-circuits
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install zkp-circuits dependencies
+        run: |
+          cd zkp-circuits
+          npm install
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: zkp-build-artifacts
+          path: zkp-circuits/build/
+
+      - name: Install zkp package dependencies
+        run: |
+          cd Packages/zkp
+          npm install
+
+      - name: Verify ZKP Engine initialization
+        run: |
+          cd Packages/zkp
+          node -e "
+            const { ZKPEngine } = require('./src/zkp-engine.ts');
+            const engine = new ZKPEngine('../../../zkp-circuits/build');
+            
+            engine.initialize().then(() => {
+              const stats = engine.getStats();
+              console.log('ZKP Engine Stats:', JSON.stringify(stats, null, 2));
+              
+              if (stats.deploymentGrade) {
+                console.log('✅ Engine is PRODUCTION GRADE');
+                process.exit(0);
+              } else {
+                console.log('❌ Engine is NOT production grade');
+                process.exit(1);
+              }
+            }).catch(err => {
+              console.error('❌ Initialization failed:', err.message);
+              process.exit(1);
+            });
+          "
+
+  deployment-readiness:
+    name: Deployment Readiness Check
+    runs-on: ubuntu-latest
+    needs: [ compile-circuits, test-circuits, verify-integration ]
+    if: success()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: zkp-build-artifacts
+          path: zkp-circuits/build/
+
+      - name: Verify all artifacts present
+        run: |
+          echo "=== Deployment Readiness Check ==="
+          
+          REQUIRED_ARTIFACTS=(
+            "authentication_verification_key.json"
+            "message_security_verification_key.json"
+            "forward_secrecy_verification_key.json"
+            "message_send_verification_key.json"
+            "message_delivery_verification_key.json"
+            "key_rotation_verification_key.json"
+            "group_message_verification_key.json"
+            "circuit_registry.json"
+          )
+          
+          cd zkp-circuits/build
+          
+          MISSING=0
+          for artifact in "${REQUIRED_ARTIFACTS[@]}"; do
+            if [ -f "$artifact" ]; then
+              echo "✓ $artifact"
+            else
+              echo "✗ $artifact (MISSING)"
+              MISSING=$((MISSING + 1))
+            fi
+          done
+          
+          echo ""
+          if [ $MISSING -eq 0 ]; then
+            echo "✅ All required artifacts present"
+            echo "✅ Deployment is READY"
+            exit 0
+          else
+            echo "❌ $MISSING artifacts missing"
+            echo "❌ Deployment NOT ready"
+            exit 1
+          fi
+
+      - name: Create deployment summary
+        if: success()
+        run: |
+          cat > deployment-summary.txt << 'EOF'
+          G3ZKP Production Deployment - Ready
+          
+          Status: ✅ PRODUCTION READY
+          
+          Circuits Compiled: 7
+          - authentication
+          - message_security
+          - forward_secrecy
+          - message_send
+          - message_delivery
+          - key_rotation
+          - group_message
+          
+          All circuits tested with real Groth16 proofs
+          All verification keys exported
+          Engine verified as deployment-grade
+          
+          Safe to deploy to production.
+          EOF
+          cat deployment-summary.txt
+
+      - name: Upload deployment summary
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-summary
+          path: deployment-summary.txt
+
+  notify-success:
+    name: Notify Success
+    runs-on: ubuntu-latest
+    needs: deployment-readiness
+    if: success()
+
+    steps:
+      - name: Log success
+        run: |
+          echo "╔═════════════════════════════════════════╗"
+          echo "║  ✅ ZKP CIRCUITS DEPLOYMENT READY      ║"
+          echo "╚═════════════════════════════════════════╝"
+          echo ""
+          echo "All production circuits have been:"
+          echo "  ✓ Successfully compiled with circom"
+          echo "  ✓ Tested with real Groth16 proofs"
+          echo "  ✓ Verified against verification keys"
+          echo "  ✓ Confirmed as deployment-grade"
+          echo ""
+          echo "Ready for: IPFS deployment, production release"
